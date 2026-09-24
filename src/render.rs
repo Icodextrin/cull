@@ -70,6 +70,8 @@ struct TextItem {
     color: [u8; 4],
     bold: bool,
     align: Align,
+    /// Draw a text cursor at this byte offset: a bar before it, or a block over the character there.
+    caret: Option<(usize, bool)>,
 }
 
 /// Everything to draw this frame, in physical pixels.
@@ -121,11 +123,19 @@ impl Frame {
     }
 
     pub fn text(&mut self, text: impl Into<String>, x: f32, y: f32, size: f32, color: [u8; 4], align: Align) {
-        self.texts.push(TextItem { text: text.into(), x, y, size, color, bold: false, align });
+        self.texts.push(TextItem { text: text.into(), x, y, size, color, bold: false, align, caret: None });
+    }
+
+    /// Left-aligned text with a cursor at byte offset `caret`, for an editable field: a bar before
+    /// that character, or with `block` a box over it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_with_caret(&mut self, text: impl Into<String>, x: f32, y: f32, size: f32, color: [u8; 4], caret: usize, block: bool) {
+        let caret = Some((caret, block));
+        self.texts.push(TextItem { text: text.into(), x, y, size, color, bold: false, align: Align::Left, caret });
     }
 
     pub fn bold_text(&mut self, text: impl Into<String>, x: f32, y: f32, size: f32, color: [u8; 4], align: Align) {
-        self.texts.push(TextItem { text: text.into(), x, y, size, color, bold: true, align });
+        self.texts.push(TextItem { text: text.into(), x, y, size, color, bold: true, align, caret: None });
     }
 }
 
@@ -402,13 +412,14 @@ impl Gpu {
         frame.quad(&self.white.tiles[0].bind_group, dst, Rect::new(0.0, 0.0, 1.0, 1.0), color, 0.0);
     }
 
-    pub fn render(&mut self, frame: Frame) {
+    pub fn render(&mut self, mut frame: Frame) {
         let (w, h) = self.size();
         self.queue.write_buffer(&self.globals_buf, 0, bytemuck::cast_slice(&[w as f32, h as f32, 0.0, 0.0]));
         self.viewport.update(&self.queue, Resolution { width: w, height: h });
 
         // Shape text; each item is drawn twice, a dark shadow then the colour, for legibility.
         let mut buffers = Vec::with_capacity(frame.texts.len());
+        let mut carets = Vec::new();
         for item in &frame.texts {
             let mut buf = Buffer::new(&mut self.font_system, Metrics::new(item.size, item.size * 1.25));
             buf.set_size(None, None);
@@ -421,7 +432,16 @@ impl Gpu {
                 Align::Center => item.x - width / 2.0,
                 Align::Right => item.x - width,
             };
+            if let Some((caret, block)) = item.caret {
+                let [r, g, b, _] = item.color;
+                let (x, glyph_w) = caret_x(&buf, caret);
+                let (w, alpha) = if block { (glyph_w.unwrap_or(item.size * 0.55), 0.4) } else { ((item.size / 9.0).max(1.0), 1.0) };
+                carets.push((Rect::new(left + x, item.y, w, item.size * 1.25), srgb(r, g, b, alpha)));
+            }
             buffers.push((buf, left));
+        }
+        for (bar, color) in carets {
+            self.rect(&mut frame, bar, color);
         }
         let bounds = TextBounds { left: 0, top: 0, right: w as i32, bottom: h as i32 };
         let mut areas = Vec::with_capacity(buffers.len() * 2);
@@ -529,4 +549,18 @@ impl Gpu {
         self.queue.present(surface_tex);
         self.atlas.trim();
     }
+}
+
+/// Horizontal offset of byte `caret` in a single-line buffer, and the width of the glyph there.
+fn caret_x(buf: &Buffer, caret: usize) -> (f32, Option<f32>) {
+    let mut x = 0.0;
+    for run in buf.layout_runs() {
+        for g in run.glyphs {
+            if g.start >= caret {
+                return (g.x, Some(g.w));
+            }
+            x = g.x + g.w;
+        }
+    }
+    (x, None)
 }

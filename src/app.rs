@@ -1,20 +1,22 @@
-//! Application state machine: browse, focus peek and review screens.
+//! Application state machine: browse, focus peek, review and move screens.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::keyboard::{Key, ModifiersState};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::catalog::Catalog;
 use crate::delete;
 use crate::layout::{fit_rect, peek_rect, Grid};
+use crate::lineedit::{self as edit, LineEdit};
 use crate::loader::{JobKind, Loaded, Loader, Payload, Rgba};
 use crate::meta::Meta;
+use crate::relocate::{self, Job};
 use crate::render::{srgb, Align, Frame, Gpu, Rect, Texture};
 use crate::state::{self, State};
 
@@ -32,6 +34,8 @@ enum Mode {
     Browse,
     Peek,
     Review,
+    /// Offer to move what's left into a new folder.
+    Move,
 }
 
 struct Cached {
@@ -51,6 +55,21 @@ struct Review {
     scroll: f32,
 }
 
+#[derive(Default)]
+struct MoveTo {
+    /// Every file left in the folder.
+    files: Vec<PathBuf>,
+    /// How many of those files are shown shots' JPEGs.
+    shots: usize,
+    /// Destination as typed; a leading `~` is expanded.
+    path: LineEdit,
+    /// Where the files are going, once the move has started.
+    dest: PathBuf,
+    job: Option<Job>,
+    /// Files dealt with so far.
+    done: usize,
+}
+
 pub struct App {
     dir: PathBuf,
     catalog: Catalog,
@@ -60,6 +79,10 @@ pub struct App {
     forward: bool,
     mode: Mode,
     windowed: bool,
+    /// Where the move screen suggests creating the dated folder.
+    dest_root: PathBuf,
+    /// Wakes the event loop from the move thread.
+    proxy: EventLoopProxy<()>,
 
     loader: Loader,
     gpu: Option<Gpu>,
@@ -73,6 +96,7 @@ pub struct App {
 
     peek_center: (f32, f32),
     review: Review,
+    moving: MoveTo,
     modifiers: ModifiersState,
     mouse: (f32, f32),
     dragging: bool,
@@ -84,7 +108,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(dir: PathBuf, catalog: Catalog, windowed: bool, loader: Loader) -> App {
+    pub fn new(
+        dir: PathBuf,
+        catalog: Catalog,
+        windowed: bool,
+        dest_root: PathBuf,
+        proxy: EventLoopProxy<()>,
+        loader: Loader,
+    ) -> App {
         let saved = state::load(&dir);
         let marked = catalog.shots.iter().map(|s| saved.marked.contains(&s.stem)).collect();
         let cursor = saved
@@ -99,6 +130,8 @@ impl App {
             forward: true,
             mode: Mode::Browse,
             windowed,
+            dest_root,
+            proxy,
             loader,
             gpu: None,
             cache: HashMap::new(),
@@ -109,6 +142,7 @@ impl App {
             meta: HashMap::new(),
             peek_center: (0.5, 0.5),
             review: Review::default(),
+            moving: MoveTo::default(),
             modifiers: ModifiersState::empty(),
             mouse: (0.0, 0.0),
             dragging: false,
@@ -134,6 +168,19 @@ impl App {
         };
         if let Err(e) = state::save(&self.dir, &st) {
             eprintln!("cull: could not save state: {e}");
+        }
+    }
+
+    /// Leave, remembering marks. On the move screen the marks are settled already, and a running
+    /// move is asked to stop; the app exits once it has.
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        match (self.mode, &self.moving.job) {
+            (Mode::Move, Some(job)) => job.cancel(),
+            (Mode::Move, None) => event_loop.exit(),
+            _ => {
+                self.save();
+                event_loop.exit();
+            }
         }
     }
 
@@ -294,7 +341,7 @@ impl App {
         let items: Vec<usize> = (0..self.n()).filter(|&i| self.marked[i]).collect();
         if items.is_empty() {
             self.save();
-            event_loop.exit();
+            self.open_move(event_loop);
             return;
         }
         let sel = items.iter().position(|&i| i >= self.cursor).unwrap_or(0);
@@ -371,6 +418,79 @@ impl App {
             self.save();
         }
         self.exit_message = Some(lines.join("\n"));
+        if trashed.failures.is_empty() {
+            self.open_move(event_loop);
+        } else {
+            event_loop.exit();
+        }
+    }
+
+    /// Offer to move everything still in the folder into a new dated one; exits if nothing is left.
+    fn open_move(&mut self, event_loop: &ActiveEventLoop) {
+        let files = relocate::remaining_files(&self.dir).unwrap_or_default();
+        if files.is_empty() {
+            event_loop.exit();
+            return;
+        }
+        let jpegs: Vec<&Path> = self.catalog.shots.iter().map(|s| s.jpeg.as_path()).filter(|j| j.exists()).collect();
+        let root = if self.dest_root.is_dir() { &self.dest_root } else { self.dir.parent().unwrap_or(&self.dir) };
+        let dest = relocate::unique(&root.join(relocate::last_taken(&jpegs, &files)));
+        self.moving = MoveTo { shots: jpegs.len(), files, path: LineEdit::new(relocate::abbreviate(&dest)), ..MoveTo::default() };
+        self.mode = Mode::Move;
+        self.show_help = false;
+        self.redraw();
+    }
+
+    fn move_key(&mut self, event_loop: &ActiveEventLoop, event: &KeyEvent) {
+        let plain = !(self.modifiers.control_key() || self.modifiers.super_key());
+        let path = &mut self.moving.path;
+        let insert = path.mode == edit::Mode::Insert;
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) if self.moving.job.is_some() || !path.escape() => self.quit(event_loop),
+            _ if self.moving.job.is_some() => {}
+            Key::Named(NamedKey::Enter) => self.start_move(),
+            Key::Named(NamedKey::ArrowLeft) => path.left(),
+            Key::Named(NamedKey::ArrowRight) => path.right(),
+            Key::Named(NamedKey::Backspace) if insert => path.backspace(),
+            Key::Named(NamedKey::Backspace) => path.left(),
+            _ if !plain => {}
+            _ if insert => {
+                let typed: String = event.text.iter().flat_map(|t| t.chars()).filter(|c| !c.is_control()).collect();
+                path.insert(&typed);
+            }
+            Key::Character(c) => path.command(c.as_str()),
+            _ => {}
+        }
+    }
+
+    fn start_move(&mut self) {
+        let typed = self.moving.path.text.trim();
+        if typed.is_empty() {
+            return;
+        }
+        self.moving.dest = relocate::unique(&relocate::expand(typed));
+        let proxy = self.proxy.clone();
+        let job = relocate::start(self.moving.files.clone(), self.moving.dest.clone(), move || {
+            let _ = proxy.send_event(());
+        });
+        self.moving.job = Some(job);
+    }
+
+    fn finish_move(&mut self, event_loop: &ActiveEventLoop, report: relocate::Report) {
+        let mut lines: Vec<String> = self.exit_message.take().into_iter().collect();
+        lines.push(format!("cull: moved {} file(s) to {}.", report.files, relocate::abbreviate(&self.moving.dest)));
+        if report.cancelled {
+            lines.push(format!("cull: stopped early; the rest are still in {}.", self.dir.display()));
+        }
+        if !report.failures.is_empty() {
+            lines.push(format!("cull: {} problem(s) moving files:", report.failures.len()));
+            for (path, err) in &report.failures {
+                lines.push(format!("  {}: {err}", path.display()));
+            }
+        } else if !report.cancelled {
+            state::remove(&self.dir);
+        }
+        self.exit_message = Some(lines.join("\n"));
         event_loop.exit();
     }
 
@@ -381,8 +501,7 @@ impl App {
         let shift = self.modifiers.shift_key();
         let key = match &event.logical_key {
             Key::Character(c) if self.modifiers.control_key() && c.as_str() == "c" => {
-                self.save();
-                event_loop.exit();
+                self.quit(event_loop);
                 return;
             }
             Key::Character(c) => c.as_str().to_owned(),
@@ -391,6 +510,11 @@ impl App {
         };
         let key = key.as_str();
 
+        if self.mode == Mode::Move {
+            self.move_key(event_loop, event);
+            self.redraw();
+            return;
+        }
         if key == "?" {
             self.show_help = !self.show_help;
             self.redraw();
@@ -456,6 +580,7 @@ impl App {
                     _ => return,
                 }
             }
+            Mode::Move => unreachable!(),
         }
         self.redraw();
     }
@@ -587,6 +712,52 @@ impl App {
                     Align::Left,
                 );
             }
+            Mode::Move => {
+                let m = &self.moving;
+                let (x, w) = (48.0 * s, sw - 96.0 * s);
+                let y = sh / 2.0 - 60.0 * s;
+                let n = m.files.len();
+                match &m.job {
+                    None => {
+                        let title = if m.shots > 0 {
+                            format!("Move the {} remaining shot(s) ({n} files) to:", m.shots)
+                        } else {
+                            format!("Move the {n} remaining file(s) to:")
+                        };
+                        f.bold_text(title, x, y, 20.0 * s, WHITE, Align::Left);
+                        gpu.rect(&mut f, Rect::new(x - 10.0 * s, y + 36.0 * s, w + 20.0 * s, 38.0 * s), srgb(34, 34, 38, 1.0));
+                        let insert = m.path.mode == edit::Mode::Insert;
+                        f.text_with_caret(m.path.text.as_str(), x, y + 44.0 * s, 18.0 * s, WHITE, m.path.caret, !insert);
+                        let typed = relocate::expand(m.path.text.trim());
+                        let actual = relocate::unique(&typed);
+                        if !m.path.text.trim().is_empty() && actual != typed {
+                            let name = actual.file_name().unwrap_or_default().to_string_lossy();
+                            f.text(format!("That folder exists, so they'll go in {name}"), x, y + 88.0 * s, 15.0 * s, RED, Align::Left);
+                        }
+                        let (mode, keys) = if insert {
+                            ("-- INSERT --", "Esc: normal mode     Enter: move")
+                        } else {
+                            (
+                                "NORMAL",
+                                "Enter: move     Esc: leave them here     w b 0 $ h l: move     cw: change word     i a I A: insert     x: delete",
+                            )
+                        };
+                        f.bold_text(mode, x, y + 120.0 * s, 14.0 * s, if insert { GREEN } else { WHITE }, Align::Left);
+                        f.text(keys, x + 110.0 * s, y + 120.0 * s, 14.0 * s, MUTED, Align::Left);
+                    }
+                    Some(job) => {
+                        let dest = relocate::abbreviate(&m.dest);
+                        f.bold_text(format!("Moving to {dest}…"), x, y, 20.0 * s, WHITE, Align::Left);
+                        let bar = Rect::new(x, y + 44.0 * s, w, 10.0 * s);
+                        gpu.rect(&mut f, bar, srgb(34, 34, 38, 1.0));
+                        let frac = m.done as f32 / n.max(1) as f32;
+                        gpu.rect(&mut f, Rect::new(bar.x, bar.y, bar.w * frac, bar.h), srgb(110, 220, 120, 1.0));
+                        f.text(format!("{} / {n} files", m.done), x, y + 66.0 * s, 15.0 * s, WHITE, Align::Left);
+                        let hint = if job.cancelled() { "Stopping after the current file…" } else { "Esc: stop after the current file" };
+                        f.text(hint, x, y + 120.0 * s, 14.0 * s, MUTED, Align::Left);
+                    }
+                }
+            }
         }
 
         if self.show_help {
@@ -712,10 +883,18 @@ impl ApplicationHandler<()> for App {
         window.request_redraw();
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _: ()) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
         let mut any = false;
         while let Ok(loaded) = self.loader.results.try_recv() {
             self.receive(loaded);
+            any = true;
+        }
+        let events: Vec<_> = self.moving.job.as_ref().map(|j| j.events.try_iter().collect()).unwrap_or_default();
+        for event in events {
+            match event {
+                relocate::Event::Progress(done) => self.moving.done = done,
+                relocate::Event::Done(report) => self.finish_move(event_loop, report),
+            }
             any = true;
         }
         if any {
@@ -726,10 +905,7 @@ impl ApplicationHandler<()> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => {
-                self.save();
-                event_loop.exit();
-            }
+            WindowEvent::CloseRequested => self.quit(event_loop),
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
@@ -779,7 +955,7 @@ impl ApplicationHandler<()> for App {
                             self.review.keep[i] = !self.review.keep[i];
                         }
                     }
-                    Mode::Peek => {}
+                    Mode::Peek | Mode::Move => {}
                 }
                 self.redraw();
             }
@@ -791,7 +967,7 @@ impl ApplicationHandler<()> for App {
                 match self.mode {
                     Mode::Review => self.review_scroll(-dy),
                     Mode::Peek => self.pan(-dx, -dy),
-                    Mode::Browse => return,
+                    Mode::Browse | Mode::Move => return,
                 }
                 self.redraw();
             }

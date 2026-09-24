@@ -2,9 +2,11 @@ mod app;
 mod catalog;
 mod delete;
 mod layout;
+mod lineedit;
 mod loader;
 mod makernote;
 mod meta;
+mod relocate;
 mod render;
 mod state;
 
@@ -13,6 +15,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use winit::event_loop::EventLoop;
+
+/// Where the move screen suggests putting the culled shots.
+const DEFAULT_DEST_ROOT: &str = "~/mnt/truenas/Pictures/Digital Photography/Raw Shots";
 
 /// Quickly cull RAW+JPEG pairs: browse the JPEGs full screen, mark rejects, trash them in pairs.
 #[derive(Parser)]
@@ -23,6 +28,10 @@ struct Args {
     /// Run in a window instead of full screen.
     #[arg(short, long)]
     windowed: bool,
+    /// Folder in which to suggest creating the dated destination folder once culling is done.
+    /// Falls back to the folder containing DIR if it doesn't exist.
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_DEST_ROOT)]
+    dest_root: String,
 }
 
 fn main() -> ExitCode {
@@ -60,10 +69,12 @@ fn main() -> ExitCode {
     };
     let proxy = event_loop.create_proxy();
     let paths = catalog.shots.iter().map(|s| s.jpeg.clone()).collect();
+    let wake = proxy.clone();
     let loader = loader::Loader::new(paths, move || {
-        let _ = proxy.send_event(());
+        let _ = wake.send_event(());
     });
-    let mut app = app::App::new(dir, catalog, args.windowed, loader);
+    let dest_root = relocate::expand(&args.dest_root);
+    let mut app = app::App::new(dir, catalog, args.windowed, dest_root, proxy, loader);
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("cull: {e}");
         return ExitCode::FAILURE;
