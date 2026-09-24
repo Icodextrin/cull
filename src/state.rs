@@ -13,9 +13,6 @@ pub struct State {
     pub version: u32,
     /// Stems of shots marked for deletion.
     pub marked: BTreeSet<String>,
-    /// Stems of shots marked as needing an edit.
-    #[serde(default)]
-    pub edit: BTreeSet<String>,
     /// Stem of the shot being viewed.
     pub cursor: Option<String>,
 }
@@ -56,14 +53,13 @@ mod tests {
         let state = State {
             version: 1,
             marked: ["a".to_string(), "b".to_string()].into(),
-            edit: ["c".to_string()].into(),
             cursor: Some("b".into()),
         };
         save(&dir, &state).unwrap();
         assert_eq!(load(&dir), state);
 
-        // Files written before the edit mark existed still load.
-        std::fs::write(path(&dir), r#"{"version":1,"marked":["a"],"cursor":null}"#).unwrap();
+        // Files written while the edit mark existed still load.
+        std::fs::write(path(&dir), r#"{"version":1,"marked":["a"],"edit":["c"],"cursor":null}"#).unwrap();
         assert_eq!(load(&dir).marked.len(), 1);
 
         remove(&dir);

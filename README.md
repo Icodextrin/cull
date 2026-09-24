@@ -1,9 +1,8 @@
 # cull
 
 A fast, keyboard-driven tool for culling RAW+JPEG pairs before import. Point it at a folder of shots.
-It shows each JPEG full screen and lets you mark each shot either for deletion or as needing an edit.
-When you finish, deleted shots (JPEG, RAW and any `.xmp` sidecars) go to the system Trash. Shots that
-need an edit are moved into a `needs-edit/` folder inside the dump directory.
+It shows each JPEG full screen and lets you mark shots for deletion. When you finish, deleted shots
+(JPEG, RAW and any `.xmp` sidecars) go to the system Trash.
 
 Works on macOS and Linux (X11/Wayland). Built in Rust with winit, wgpu, zune-jpeg and glyphon.
 
@@ -36,17 +35,16 @@ Marks and your position are saved to `.cull-state.json` in the folder, so you ca
 |---|---|---|
 | Browse | ← → / h l (also ↑ ↓ / k j) | previous / next |
 | Browse | Space | mark / unmark for deletion (greys out, red frame) |
-| Browse | e | mark / unmark as needs edit (amber frame) |
 | Browse | f, or click | focus peek at 100% (click peeks at that spot) |
 | Browse | g / G, Home / End | first / last |
 | Browse / Peek | m | show / hide shooting metadata (camera, lens, colour profile, focal length, aperture, shutter, ISO, exposure comp., time) |
 | Browse | q / Esc | review marked shots and finish (quits if none are marked) |
 | Peek | arrows / hjkl | pan (hold Shift for bigger steps); drag or scroll also pan |
-| Peek | Space / e | mark for deletion / as needs edit |
+| Peek | Space | mark / unmark for deletion |
 | Peek | n / p | next / previous shot, keeping the same pan position |
 | Peek | f / Esc | back to full screen |
 | Review | arrows / hjkl, scroll | move / scroll |
 | Review | Space, or click | keep this shot (clear its mark) |
-| Review | y / Enter | trash the delete marks, move the edit marks to `needs-edit/`, and exit |
+| Review | y / Enter | move the marked shots to Trash and exit |
 | Review | n / Esc | back to browsing |
 | Any | ? | help |

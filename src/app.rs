@@ -26,14 +26,6 @@ const WHITE: [u8; 4] = [235, 235, 235, 255];
 const MUTED: [u8; 4] = [170, 170, 170, 255];
 const RED: [u8; 4] = [255, 80, 70, 255];
 const GREEN: [u8; 4] = [110, 220, 120, 255];
-const AMBER: [u8; 4] = [255, 190, 60, 255];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mark {
-    None,
-    Delete,
-    Edit,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -51,7 +43,7 @@ struct Cached {
 
 #[derive(Default)]
 struct Review {
-    /// Shot indices that were marked (either way) when the review screen opened.
+    /// Shot indices that were marked when the review screen opened.
     items: Vec<usize>,
     /// Items the user chose to keep after all.
     keep: Vec<bool>,
@@ -62,7 +54,8 @@ struct Review {
 pub struct App {
     dir: PathBuf,
     catalog: Catalog,
-    marks: Vec<Mark>,
+    /// Whether each shot is marked for deletion.
+    marked: Vec<bool>,
     cursor: usize,
     forward: bool,
     mode: Mode,
@@ -93,19 +86,7 @@ pub struct App {
 impl App {
     pub fn new(dir: PathBuf, catalog: Catalog, windowed: bool, loader: Loader) -> App {
         let saved = state::load(&dir);
-        let marks = catalog
-            .shots
-            .iter()
-            .map(|s| {
-                if saved.marked.contains(&s.stem) {
-                    Mark::Delete
-                } else if saved.edit.contains(&s.stem) {
-                    Mark::Edit
-                } else {
-                    Mark::None
-                }
-            })
-            .collect();
+        let marked = catalog.shots.iter().map(|s| saved.marked.contains(&s.stem)).collect();
         let cursor = saved
             .cursor
             .and_then(|stem| catalog.shots.iter().position(|s| s.stem == stem))
@@ -113,7 +94,7 @@ impl App {
         App {
             dir,
             catalog,
-            marks,
+            marked,
             cursor,
             forward: true,
             mode: Mode::Browse,
@@ -141,19 +122,14 @@ impl App {
         self.catalog.shots.len()
     }
 
-    fn count(&self, mark: Mark) -> usize {
-        self.marks.iter().filter(|&&m| m == mark).count()
-    }
-
-    fn stems(&self, mark: Mark) -> std::collections::BTreeSet<String> {
-        self.catalog.shots.iter().zip(&self.marks).filter(|(_, m)| **m == mark).map(|(s, _)| s.stem.clone()).collect()
+    fn marked_count(&self) -> usize {
+        self.marked.iter().filter(|&&m| m).count()
     }
 
     fn save(&self) {
         let st = State {
             version: 1,
-            marked: self.stems(Mark::Delete),
-            edit: self.stems(Mark::Edit),
+            marked: self.catalog.shots.iter().zip(&self.marked).filter(|(_, m)| **m).map(|(s, _)| s.stem.clone()).collect(),
             cursor: Some(self.catalog.shots[self.cursor].stem.clone()),
         };
         if let Err(e) = state::save(&self.dir, &st) {
@@ -241,7 +217,7 @@ impl App {
         match payload {
             Payload::Fit { fit, thumb, full_width, full_height, meta } => {
                 self.meta.insert(idx, meta);
-                if self.marks[idx] != Mark::None && !self.thumbs.contains_key(&idx) {
+                if self.marked[idx] && !self.thumbs.contains_key(&idx) {
                     self.thumbs.insert(idx, gpu.upload(&thumb));
                 }
                 if self.in_window(idx) {
@@ -255,7 +231,7 @@ impl App {
                 }
             }
             Payload::Thumb(img) => {
-                if self.marks[idx] != Mark::None {
+                if self.marked[idx] {
                     self.thumbs.insert(idx, gpu.upload(&img));
                 }
             }
@@ -277,11 +253,11 @@ impl App {
         self.go_to(target);
     }
 
-    /// Set the current shot's mark, or clear it if it already has that mark.
-    fn toggle_mark(&mut self, mark: Mark) {
+    /// Mark or unmark the current shot for deletion.
+    fn toggle_mark(&mut self) {
         let idx = self.cursor;
-        self.marks[idx] = if self.marks[idx] == mark { Mark::None } else { mark };
-        if self.marks[idx] != Mark::None {
+        self.marked[idx] = !self.marked[idx];
+        if self.marked[idx] {
             if let (Some(gpu), Some(thumb)) = (&self.gpu, self.cache.get(&idx).and_then(|c| c.thumb.as_ref())) {
                 self.thumbs.insert(idx, gpu.upload(thumb));
             }
@@ -315,7 +291,7 @@ impl App {
     }
 
     fn open_review(&mut self, event_loop: &ActiveEventLoop) {
-        let items: Vec<usize> = (0..self.n()).filter(|&i| self.marks[i] != Mark::None).collect();
+        let items: Vec<usize> = (0..self.n()).filter(|&i| self.marked[i]).collect();
         if items.is_empty() {
             self.save();
             event_loop.exit();
@@ -331,7 +307,7 @@ impl App {
     fn close_review(&mut self) {
         for (i, &idx) in self.review.items.iter().enumerate() {
             if self.review.keep[i] {
-                self.marks[idx] = Mark::None;
+                self.marked[idx] = false;
                 self.thumbs.remove(&idx);
             }
         }
@@ -357,19 +333,14 @@ impl App {
         self.review.scroll = (self.review.scroll + dy).clamp(0.0, max);
     }
 
-    /// Review items (shot indices) with `mark` that the user didn't choose to keep.
-    fn pending_items(&self, mark: Mark) -> Vec<usize> {
-        (0..self.review.items.len())
-            .filter(|&i| !self.review.keep[i])
-            .map(|i| self.review.items[i])
-            .filter(|&idx| self.marks[idx] == mark)
-            .collect()
+    /// Review items (shot indices) the user didn't choose to keep.
+    fn doomed(&self) -> Vec<usize> {
+        (0..self.review.items.len()).filter(|&i| !self.review.keep[i]).map(|i| self.review.items[i]).collect()
     }
 
     fn confirm(&mut self, event_loop: &ActiveEventLoop) {
-        let doomed = self.pending_items(Mark::Delete);
-        let edits = self.pending_items(Mark::Edit);
-        if doomed.is_empty() && edits.is_empty() {
+        let doomed = self.doomed();
+        if doomed.is_empty() {
             self.close_review();
             return;
         }
@@ -382,28 +353,19 @@ impl App {
         }
         let shots = &self.catalog.shots;
         let trashed = delete::trash_shots(doomed.iter().map(|&i| &shots[i]));
-        let dest = self.dir.join(delete::NEEDS_EDIT_DIR);
-        let moved = delete::move_shots(edits.iter().map(|&i| &shots[i]), &dest);
 
-        let mut lines = Vec::new();
-        if !doomed.is_empty() {
-            lines.push(format!("cull: moved {} shot(s), {} file(s) to Trash.", trashed.shots, trashed.files));
-        }
-        if !edits.is_empty() {
-            lines.push(format!("cull: moved {} shot(s), {} file(s) to {}", moved.shots, moved.files, dest.display()));
-        }
-        let failures: Vec<_> = trashed.failures.iter().chain(&moved.failures).collect();
-        if failures.is_empty() {
+        let mut lines = vec![format!("cull: moved {} shot(s), {} file(s) to Trash.", trashed.shots, trashed.files)];
+        if trashed.failures.is_empty() {
             state::remove(&self.dir);
         } else {
-            lines.push(format!("cull: {} file(s) could not be moved:", failures.len()));
-            for (path, err) in &failures {
+            lines.push(format!("cull: {} file(s) could not be moved:", trashed.failures.len()));
+            for (path, err) in &trashed.failures {
                 lines.push(format!("  {}: {err}", path.display()));
             }
             // Keep marks only for shots that are still here, so a rerun can retry them.
             for (i, &idx) in self.review.items.iter().enumerate() {
                 if self.review.keep[i] || !self.catalog.shots[idx].jpeg.exists() {
-                    self.marks[idx] = Mark::None;
+                    self.marked[idx] = false;
                 }
             }
             self.save();
@@ -443,8 +405,7 @@ impl App {
                 "End" | "G" => self.go_to(usize::MAX),
                 "PageUp" => self.step(-10),
                 "PageDown" => self.step(10),
-                "Space" => self.toggle_mark(Mark::Delete),
-                "e" => self.toggle_mark(Mark::Edit),
+                "Space" => self.toggle_mark(),
                 "f" => self.enter_peek((0.5, 0.5)),
                 "m" => self.show_meta = !self.show_meta,
                 "q" | "Escape" => {
@@ -464,8 +425,7 @@ impl App {
                     "ArrowRight" | "l" | "L" => self.pan(sx, 0.0),
                     "ArrowUp" | "k" | "K" => self.pan(0.0, -sy),
                     "ArrowDown" | "j" | "J" => self.pan(0.0, sy),
-                    "Space" => self.toggle_mark(Mark::Delete),
-                    "e" => self.toggle_mark(Mark::Edit),
+                    "Space" => self.toggle_mark(),
                     "m" => self.show_meta = !self.show_meta,
                     "n" | "PageDown" => self.step(1),
                     "p" | "PageUp" => self.step(-1),
@@ -509,8 +469,8 @@ impl App {
         let s = gpu.window.scale_factor() as f32;
         let mut f = Frame::default();
         let shot = &self.catalog.shots[self.cursor];
-        let mark = self.marks[self.cursor];
-        let dim = if mark == Mark::Delete { 0.85 } else { 0.0 };
+        let marked = self.marked[self.cursor];
+        let dim = if marked { 0.85 } else { 0.0 };
 
         match self.mode {
             Mode::Browse | Mode::Peek => {
@@ -519,10 +479,8 @@ impl App {
                     if let Some(c) = cached {
                         let r = fit_rect(c.tex.width as f32, c.tex.height as f32, sw, sh);
                         f.image(&c.tex, r, dim);
-                        match mark {
-                            Mark::Delete => outline(gpu, &mut f, r, 4.0 * s, srgb(255, 80, 70, 0.9)),
-                            Mark::Edit => outline(gpu, &mut f, r, 4.0 * s, srgb(255, 190, 60, 0.9)),
-                            Mark::None => {}
+                        if marked {
+                            outline(gpu, &mut f, r, 4.0 * s, srgb(255, 80, 70, 0.9));
                         }
                     }
                 } else if let Some((iw, ih)) = self.full_dims() {
@@ -548,10 +506,8 @@ impl App {
                 if self.show_meta {
                     metadata(gpu, &mut f, self.meta.get(&self.cursor), s);
                 }
-                match mark {
-                    Mark::Delete => f.bold_text("MARKED FOR DELETION", sw / 2.0, 14.0 * s, 20.0 * s, RED, Align::Center),
-                    Mark::Edit => f.bold_text("NEEDS EDIT", sw / 2.0, 14.0 * s, 20.0 * s, AMBER, Align::Center),
-                    Mark::None => {}
+                if marked {
+                    f.bold_text("MARKED FOR DELETION", sw / 2.0, 14.0 * s, 20.0 * s, RED, Align::Center);
                 }
 
                 let name = shot.jpeg.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
@@ -574,20 +530,12 @@ impl App {
                     WHITE,
                     Align::Left,
                 );
-                let (deletes, edits) = (self.count(Mark::Delete), self.count(Mark::Edit));
+                let deletes = self.marked_count();
                 let help_w = 60.0 * s;
                 f.text("? help", sw - 16.0 * s, y, 15.0 * s, MUTED, Align::Right);
                 f.text(
-                    format!("{edits} to edit"),
-                    sw - 16.0 * s - help_w,
-                    y,
-                    15.0 * s,
-                    if edits > 0 { AMBER } else { MUTED },
-                    Align::Right,
-                );
-                f.text(
                     format!("{deletes} to delete"),
-                    sw - 16.0 * s - help_w - 110.0 * s,
+                    sw - 16.0 * s - help_w,
                     y,
                     15.0 * s,
                     if deletes > 0 { RED } else { MUTED },
@@ -613,40 +561,22 @@ impl App {
                     if cell.y + cell.h - 24.0 * s > grid.top {
                         let label = &self.catalog.shots[idx].stem;
                         f.text(label.as_str(), cell.x + 8.0 * s, cell.y + cell.h - 24.0 * s, 13.0 * s, WHITE, Align::Left);
-                        let (badge, color) = match (keep, self.marks[idx]) {
-                            (true, _) => ("KEEP", GREEN),
-                            (false, Mark::Edit) => ("EDIT", AMBER),
-                            (false, _) => ("DELETE", RED),
-                        };
+                        let (badge, color) = if keep { ("KEEP", GREEN) } else { ("DELETE", RED) };
                         f.bold_text(badge, cell.x + cell.w - 8.0 * s, cell.y + cell.h - 24.0 * s, 13.0 * s, color, Align::Right);
                     }
                     if i == self.review.sel {
                         outline(gpu, &mut f, cell, 3.0 * s, srgb(255, 255, 255, 1.0));
-                    } else if !keep && self.marks[idx] == Mark::Edit {
-                        outline(gpu, &mut f, cell, 2.0 * s, srgb(255, 190, 60, 0.9));
                     }
                 }
                 // Header drawn last so it covers rows scrolled beneath it.
                 gpu.rect(&mut f, Rect::new(0.0, 0.0, sw, grid.top), srgb(18, 18, 20, 0.97));
-                let summary = |mark| {
-                    let items = self.pending_items(mark);
-                    let files: usize = items.iter().map(|&i| self.catalog.shots[i].files().count()).sum();
-                    (items.len(), files)
+                let doomed = self.doomed();
+                let files: usize = doomed.iter().map(|&i| self.catalog.shots[i].files().count()).sum();
+                let (title, color) = if doomed.is_empty() {
+                    ("Nothing to do (everything kept)".to_owned(), WHITE)
+                } else {
+                    (format!("Move {} shot(s) ({files} files) to Trash?", doomed.len()), RED)
                 };
-                let (deletes, delete_files) = summary(Mark::Delete);
-                let (edits, edit_files) = summary(Mark::Edit);
-                let mut parts = Vec::new();
-                if deletes > 0 {
-                    parts.push(format!("move {deletes} shot(s) ({delete_files} files) to Trash"));
-                }
-                if edits > 0 {
-                    parts.push(format!("move {edits} shot(s) ({edit_files} files) to {}/", delete::NEEDS_EDIT_DIR));
-                }
-                let title = match parts.join(" and ") {
-                    t if t.is_empty() => "Nothing to do (everything kept)".to_owned(),
-                    t => format!("{}{}?", t[..1].to_uppercase(), &t[1..]),
-                };
-                let color = if deletes > 0 { RED } else if edits > 0 { AMBER } else { WHITE };
                 f.bold_text(title, 16.0 * s, 14.0 * s, 20.0 * s, color, Align::Left);
                 f.text(
                     "y / Enter: confirm     n / Esc: back     Space / click: keep",
@@ -722,7 +652,6 @@ fn help(gpu: &Gpu, f: &mut Frame, sw: f32, sh: f32, s: f32) {
         ("Browse", ""),
         ("← → / h l", "previous / next"),
         ("Space", "mark / unmark for deletion"),
-        ("e", "mark / unmark as needs edit"),
         ("f  or click", "focus peek (100%)"),
         ("g / G", "first / last"),
         ("m", "show / hide metadata"),
