@@ -115,7 +115,7 @@ fn copy_then_remove(src: &Path, dst: &Path) -> io::Result<()> {
         if let Ok(t) = meta.modified() {
             let _ = out.set_modified(t);
         }
-        out.sync_all()?;
+        flush(&out)?;
         fs::rename(&tmp, dst)
     };
     if let Err(e) = copy() {
@@ -123,6 +123,18 @@ fn copy_then_remove(src: &Path, dst: &Path) -> io::Result<()> {
         return Err(e);
     }
     fs::remove_file(src)
+}
+
+/// `sync_all`, which on macOS is `F_FULLFSYNC`. Network shares (smbfs, nfs) reject that with
+/// ENOTSUP, so fall back to a plain `fsync`, which still pushes the data to the server.
+fn flush(file: &File) -> io::Result<()> {
+    match file.sync_all() {
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+        }
+        other => other,
+    }
 }
 
 #[derive(Default)]

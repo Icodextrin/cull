@@ -486,6 +486,7 @@ dependencies = [
  "fast_image_resize",
  "glyphon",
  "kamadak-exif",
+ "libc",
  "pollster",
  "serde",
  "serde_json",
