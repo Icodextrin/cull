@@ -28,7 +28,7 @@ struct Args {
     /// Run in a window instead of full screen.
     #[arg(short, long)]
     windowed: bool,
-    /// Folder in which to suggest creating the dated destination folder once culling is done.
+    /// Folder in which to suggest creating the YYYY/YYYY-MM-DD destination folder once culling is done.
     /// Falls back to the folder containing DIR if it doesn't exist.
     #[arg(long, value_name = "DIR", default_value = DEFAULT_DEST_ROOT)]
     dest_root: String,

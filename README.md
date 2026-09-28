@@ -30,7 +30,7 @@ Fujifilm film simulations, Canon Picture Styles (including the base of User Def.
 Mode / Photo Style, Nikon Picture Controls and Sony Creative Styles.
 
 After the Trash step (or straight away, if nothing was marked) the move screen suggests
-`<dest-root>/YYYY-MM-DD`. The date is the latest EXIF capture date among the kept shots, or the latest
+`<dest-root>/YYYY/YYYY-MM-DD`. The date is the latest EXIF capture date among the kept shots, or the latest
 file modification time if they have none. If that folder exists, cull uses `YYYY-MM-DD_1`, `_2`, …
 instead. You can edit the path before confirming, with vi-style keys (it starts in normal mode). The
 same rule applies to whatever you type, so nothing is ever overwritten. Every visible file left in the folder is moved (videos, RAWs with no JPEG

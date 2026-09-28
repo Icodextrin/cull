@@ -434,7 +434,8 @@ impl App {
         }
         let jpegs: Vec<&Path> = self.catalog.shots.iter().map(|s| s.jpeg.as_path()).filter(|j| j.exists()).collect();
         let root = if self.dest_root.is_dir() { &self.dest_root } else { self.dir.parent().unwrap_or(&self.dir) };
-        let dest = relocate::unique(&root.join(relocate::last_taken(&jpegs, &files)));
+        let day = relocate::last_taken(&jpegs, &files);
+        let dest = relocate::unique(&root.join(&day[..4]).join(&day));
         self.moving = MoveTo { shots: jpegs.len(), files, path: LineEdit::new(relocate::abbreviate(&dest)), ..MoveTo::default() };
         self.mode = Mode::Move;
         self.show_help = false;
