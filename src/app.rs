@@ -1,7 +1,7 @@
 //! Application state machine: browse, focus peek, review and move screens.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
@@ -28,6 +28,8 @@ const WHITE: [u8; 4] = [235, 235, 235, 255];
 const MUTED: [u8; 4] = [170, 170, 170, 255];
 const RED: [u8; 4] = [255, 80, 70, 255];
 const GREEN: [u8; 4] = [110, 220, 120, 255];
+/// Day folders listed on the move screen before "…and N more".
+const MAX_DAYS_LISTED: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -57,14 +59,16 @@ struct Review {
 
 #[derive(Default)]
 struct MoveTo {
-    /// Every file left in the folder.
-    files: Vec<PathBuf>,
+    /// Every file left in the folder, grouped by the day it was taken (`YYYY-MM-DD`), oldest first.
+    days: Vec<(String, Vec<PathBuf>)>,
+    /// How many files that is in all.
+    files: usize,
     /// How many of those files are shown shots' JPEGs.
     shots: usize,
-    /// Destination as typed; a leading `~` is expanded.
+    /// Folder the YYYY/YYYY-MM-DD folders go in, as typed; a leading `~` is expanded.
     path: LineEdit,
-    /// Where the files are going, once the move has started.
-    dest: PathBuf,
+    /// Where each day's files are going, once the move has started.
+    dests: Vec<PathBuf>,
     job: Option<Job>,
     /// Files dealt with so far.
     done: usize,
@@ -79,7 +83,7 @@ pub struct App {
     forward: bool,
     mode: Mode,
     windowed: bool,
-    /// Where the move screen suggests creating the dated folder.
+    /// Where the move screen suggests creating the YYYY/YYYY-MM-DD folders.
     dest_root: PathBuf,
     /// Wakes the event loop from the move thread.
     proxy: EventLoopProxy<()>,
@@ -425,18 +429,20 @@ impl App {
         }
     }
 
-    /// Offer to move everything still in the folder into a new dated one; exits if nothing is left.
+    /// Offer to move everything still in the folder into a folder for the day it was taken; exits if
+    /// nothing is left.
     fn open_move(&mut self, event_loop: &ActiveEventLoop) {
         let files = relocate::remaining_files(&self.dir).unwrap_or_default();
         if files.is_empty() {
             event_loop.exit();
             return;
         }
-        let jpegs: Vec<&Path> = self.catalog.shots.iter().map(|s| s.jpeg.as_path()).filter(|j| j.exists()).collect();
+        let shots = self.catalog.shots.iter().filter(|s| s.jpeg.exists()).count();
         let root = if self.dest_root.is_dir() { &self.dest_root } else { self.dir.parent().unwrap_or(&self.dir) };
-        let day = relocate::last_taken(&jpegs, &files);
-        let dest = relocate::unique(&root.join(&day[..4]).join(&day));
-        self.moving = MoveTo { shots: jpegs.len(), files, path: LineEdit::new(relocate::abbreviate(&dest)), ..MoveTo::default() };
+        let path = LineEdit::new(relocate::abbreviate(root));
+        let n = files.len();
+        let days = relocate::by_day(files, &self.catalog.shots);
+        self.moving = MoveTo { days, files: n, shots, path, ..MoveTo::default() };
         self.mode = Mode::Move;
         self.show_help = false;
         self.redraw();
@@ -469,9 +475,12 @@ impl App {
         if typed.is_empty() {
             return;
         }
-        self.moving.dest = relocate::unique(&relocate::expand(typed));
+        let root = relocate::expand(typed);
+        let batches: Vec<_> =
+            self.moving.days.iter().map(|(day, files)| (relocate::day_folder(&root, day), files.clone())).collect();
+        self.moving.dests = batches.iter().map(|(dest, _)| dest.clone()).collect();
         let proxy = self.proxy.clone();
-        let job = relocate::start(self.moving.files.clone(), self.moving.dest.clone(), move || {
+        let job = relocate::start(batches, move || {
             let _ = proxy.send_event(());
         });
         self.moving.job = Some(job);
@@ -479,7 +488,17 @@ impl App {
 
     fn finish_move(&mut self, event_loop: &ActiveEventLoop, report: relocate::Report) {
         let mut lines: Vec<String> = self.exit_message.take().into_iter().collect();
-        lines.push(format!("cull: moved {} file(s) to {}.", report.files, relocate::abbreviate(&self.moving.dest)));
+        lines.push(format!("cull: moved {} file(s) to:", report.files));
+        for dest in &self.moving.dests {
+            lines.push(format!("  {}", relocate::abbreviate(dest)));
+        }
+        if !report.renamed.is_empty() {
+            lines.push(format!("cull: {} file(s) renamed because the name was taken:", report.renamed.len()));
+            for (from, to) in &report.renamed {
+                let name = from.file_name().unwrap_or_default().to_string_lossy();
+                lines.push(format!("  {name} → {}", relocate::abbreviate(to)));
+            }
+        }
         if report.cancelled {
             lines.push(format!("cull: stopped early; the rest are still in {}.", self.dir.display()));
         }
@@ -717,23 +736,32 @@ impl App {
                 let m = &self.moving;
                 let (x, w) = (48.0 * s, sw - 96.0 * s);
                 let y = sh / 2.0 - 60.0 * s;
-                let n = m.files.len();
+                let n = m.files;
                 match &m.job {
                     None => {
                         let title = if m.shots > 0 {
-                            format!("Move the {} remaining shot(s) ({n} files) to:", m.shots)
+                            format!("Move the {} remaining shot(s) ({n} files) into a folder per day under:", m.shots)
                         } else {
-                            format!("Move the {n} remaining file(s) to:")
+                            format!("Move the {n} remaining file(s) into a folder per day under:")
                         };
                         f.bold_text(title, x, y, 20.0 * s, WHITE, Align::Left);
                         gpu.rect(&mut f, Rect::new(x - 10.0 * s, y + 36.0 * s, w + 20.0 * s, 38.0 * s), srgb(34, 34, 38, 1.0));
                         let insert = m.path.mode == edit::Mode::Insert;
                         f.text_with_caret(m.path.text.as_str(), x, y + 44.0 * s, 18.0 * s, WHITE, m.path.caret, !insert);
-                        let typed = relocate::expand(m.path.text.trim());
-                        let actual = relocate::unique(&typed);
-                        if !m.path.text.trim().is_empty() && actual != typed {
-                            let name = actual.file_name().unwrap_or_default().to_string_lossy();
-                            f.text(format!("That folder exists, so they'll go in {name}"), x, y + 88.0 * s, 15.0 * s, RED, Align::Left);
+                        let root = relocate::expand(m.path.text.trim());
+                        if !m.path.text.trim().is_empty() {
+                            let mut ly = y + 170.0 * s;
+                            for (day, files) in m.days.iter().take(MAX_DAYS_LISTED) {
+                                let dest = relocate::day_folder(&root, day);
+                                let name = dest.strip_prefix(&root).unwrap_or(&dest).display().to_string();
+                                let note = if dest.is_dir() { "  (adding to existing folder)" } else { "" };
+                                f.text(format!("{name}    {} file(s){note}", files.len()), x, ly, 15.0 * s, WHITE, Align::Left);
+                                ly += 22.0 * s;
+                            }
+                            if m.days.len() > MAX_DAYS_LISTED {
+                                let more = m.days.len() - MAX_DAYS_LISTED;
+                                f.text(format!("…and {more} more day(s)"), x, ly, 15.0 * s, MUTED, Align::Left);
+                            }
                         }
                         let (mode, keys) = if insert {
                             ("-- INSERT --", "Esc: normal mode     Enter: move")
@@ -747,8 +775,9 @@ impl App {
                         f.text(keys, x + 110.0 * s, y + 120.0 * s, 14.0 * s, MUTED, Align::Left);
                     }
                     Some(job) => {
-                        let dest = relocate::abbreviate(&m.dest);
-                        f.bold_text(format!("Moving to {dest}…"), x, y, 20.0 * s, WHITE, Align::Left);
+                        let root = relocate::abbreviate(&relocate::expand(m.path.text.trim()));
+                        let days = m.dests.len();
+                        f.bold_text(format!("Moving into {days} day folder(s) under {root}…"), x, y, 20.0 * s, WHITE, Align::Left);
                         let bar = Rect::new(x, y + 44.0 * s, w, 10.0 * s);
                         gpu.rect(&mut f, bar, srgb(34, 34, 38, 1.0));
                         let frac = m.done as f32 / n.max(1) as f32;

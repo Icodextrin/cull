@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use winit::event_loop::EventLoop;
 
-/// Where the move screen suggests putting the culled shots.
+/// Where the move screen suggests sorting the culled shots into day folders.
 const DEFAULT_DEST_ROOT: &str = "~/mnt/truenas/Pictures/Digital Photography/Raw Shots";
 
 /// Quickly cull RAW+JPEG pairs: browse the JPEGs full screen, mark rejects, trash them in pairs.
@@ -28,7 +28,8 @@ struct Args {
     /// Run in a window instead of full screen.
     #[arg(short, long)]
     windowed: bool,
-    /// Folder in which to suggest creating the YYYY/YYYY-MM-DD destination folder once culling is done.
+    /// Folder in which to suggest sorting the remaining files into YYYY/YYYY-MM-DD folders, one per day
+    /// taken, once culling is done.
     /// Falls back to the folder containing DIR if it doesn't exist.
     #[arg(long, value_name = "DIR", default_value = DEFAULT_DEST_ROOT)]
     dest_root: String,
